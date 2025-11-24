@@ -1,63 +1,140 @@
-# app_streamlit.py
+# app.py
 import os
 import re
 import uuid
 import base64
 import logging
-import tempfile
 from io import BytesIO
 
-import requests
-from pdf2image import convert_from_bytes
-try:
-    import fitz  # PyMuPDF
-except Exception:
-    fitz = None
-
 import streamlit as st
-from werkzeug.utils import secure_filename  # convenient filename sanitizer
-from dotenv import load_dotenv
+from PIL import Image
+import requests
+import mimetypes
 
-# ---- Load .env (optional) ----
-load_dotenv()
+# use PyMuPDF to handle PDFs (render pages to images & extract text)
+import fitz  # pip install pymupdf
+
 logging.basicConfig(level=logging.INFO)
 
-# ---- Config: prefer Streamlit secrets, fallback to env vars ----
-API_KEY = st.secrets.get("API_KEY") if "API_KEY" in st.secrets else os.getenv("API_KEY")
-GEMINI_ENDPOINT = st.secrets.get("GEMINI_ENDPOINT") if "GEMINI_ENDPOINT" in st.secrets else os.getenv(
+# ----------------------
+# Config & secrets
+# ----------------------
+# Streamlit secrets or environment variables
+API_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+GEMINI_ENDPOINT = st.secrets.get("GEMINI_ENDPOINT") or os.getenv(
     "GEMINI_ENDPOINT",
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 )
-POPPLER_PATH = st.secrets.get("POPPLER_PATH") if "POPPLER_PATH" in st.secrets else os.getenv(
-    "POPPLER_PATH", None
+
+# Upload folder (local working copy when running locally)
+UPLOAD_ROOT = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOAD_ROOT, exist_ok=True)
+
+# Optional preloaded sample file path (from your uploaded files)
+SAMPLE_PDF = "/mnt/data/BDA MODULE 1 ,2  Assignment1.docx (2).pdf"
+
+st.set_page_config(page_title="Vigilant - Auto Evaluate (Streamlit)", layout="wide")
+st.title("📄 Vigilant — Auto-evaluate Handwritten Answers (Streamlit)")
+
+st.markdown(
+    """
+This app extracts handwritten text/images from uploaded PDFs or images, sends to Gemini for OCR or evaluation, and shows results.
+**Important:** Put your Gemini API key into Streamlit Cloud Secrets as `GEMINI_API_KEY`. See deploy instructions below.
+"""
 )
 
-# ---- App settings ----
-st.set_page_config(page_title="Vigilant: Auto-evaluator", layout="wide")
-st.title("Vigilant — Knowledge Base + Handwritten Answer Evaluator")
+# ----------------------
+# Helpers
+# ----------------------
+def render_image_from_bytes(img_bytes):
+    try:
+        img = Image.open(BytesIO(img_bytes))
+        return img
+    except Exception:
+        return None
 
-# ---- Upload area ----
-st.markdown("Upload a **question paper / knowledge base** (PDF/DOCX) and one or more **student answer sheets** (PDF or images).")
-kb_file = st.file_uploader("Upload Knowledge Base (PDF preferred)", type=["pdf", "txt"], key="kb")
-answer_files = st.file_uploader("Upload Answer Sheets (PDF or image). You can upload multiple files.", type=["pdf", "png", "jpg", "jpeg", "tiff"], accept_multiple_files=True, key="answers")
-
-# ---- Utility helpers ----
-def call_gemini(prompt, img_b64=None, mime_type="image/jpeg", timeout=30):
+def pdf_to_images_and_text(pdf_bytes):
     """
-    Sends prompt (and optionally an inline image) to Gemini endpoint.
-    Returns the text response or raises an exception.
+    Use PyMuPDF (fitz) to render PDF pages to images (JPEG) and also extract page text.
+    Returns list of base64 images and list of text strings (per page).
     """
-    if API_KEY is None:
-        raise RuntimeError("API_KEY is not set. See instructions in the app header or README.")
+    imgs_b64 = []
+    texts = []
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for page in doc:
+            # text extraction
+            page_text = page.get_text()
+            texts.append(page_text)
 
-    contents = []
-    parts = [{"text": prompt}]
-    if img_b64:
-        parts.append({"inlineData": {"mimeType": mime_type, "data": img_b64}})
-    contents.append({"parts": parts})
-    request_body = {"contents": contents}
+            # render page to image (matrix 2.0 for better resolution)
+            mat = fitz.Matrix(2.0, 2.0)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img_bytes = pix.tobytes("jpeg")
+            b64 = base64.b64encode(img_bytes).decode("utf-8")
+            imgs_b64.append(b64)
+        doc.close()
+    except Exception as e:
+        logging.exception("pdf_to_images_and_text failed")
+        raise
+    return imgs_b64, texts
 
-    resp = requests.post(f"{GEMINI_ENDPOINT}?key={API_KEY}", json=request_body, timeout=timeout)
+def call_gemini_ocr_from_b64(img_b64: str, mime_type="image/jpeg"):
+    """
+    Send a single base64 image to Gemini (as inline binary) and request extraction.
+    The prompt instructs Gemini to extract the handwritten answer text only.
+    """
+    if not API_KEY:
+        raise RuntimeError("GEMINI API key not configured. Set GEMINI_API_KEY in Streamlit secrets.")
+    prompt = "Extract handwritten answer text from this image. Return only the extracted text, do not add commentary."
+    request_body = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {"inlineData": {"mimeType": mime_type, "data": img_b64}}
+                ]
+            }
+        ]
+    }
+    resp = requests.post(f"{GEMINI_ENDPOINT}?key={API_KEY}", json=request_body, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    # parse response safely
+    candidates = data.get("candidates", [])
+    if candidates and "content" in candidates[0]:
+        parts = candidates[0]["content"].get("parts", [])
+        if parts and "text" in parts[0]:
+            return parts[0]["text"].strip()
+    return ""
+
+def call_gemini_evaluate(kb_text: str, student_text: str):
+    """
+    Ask Gemini to evaluate the student's extracted text using the question paper KB.
+    Returns Gemini's textual evaluation.
+    """
+    if not API_KEY:
+        raise RuntimeError("GEMINI API key not configured. Set GEMINI_API_KEY in Streamlit secrets.")
+    prompt = f"""
+You are an examiner. Use the Question Paper / Answer Key (below) to evaluate the student's handwritten answer.
+Question Paper / KB:
+\"\"\"{kb_text}\"\"\"
+
+Student Answer:
+\"\"\"{student_text}\"\"\"
+
+Return an evaluation with:
+- Total Marks (out of 50)
+- Relevance
+- Accuracy
+- Missing Key Points
+- Suggestions
+- One-line summary feedback
+
+Return plain text only.
+"""
+    request_body = {"contents": [{"parts": [{"text": prompt}]}]}
+    resp = requests.post(f"{GEMINI_ENDPOINT}?key={API_KEY}", json=request_body, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     candidates = data.get("candidates", [])
@@ -65,195 +142,158 @@ def call_gemini(prompt, img_b64=None, mime_type="image/jpeg", timeout=30):
         parts = candidates[0]["content"].get("parts", [])
         if parts and "text" in parts[0]:
             return parts[0]["text"].strip()
-    return "[No text returned by Gemini]"
+    return "[No evaluation returned]"
 
+def extract_marks_from_text(evaluation_text: str):
+    m = re.search(
+        r"(?:Total\s*Marks|Marks\s*Awarded|Score)\s*[:=\-]?\s*([0-9]+(?:\.[0-9]+)?(?:\s*/\s*[0-9]+)?)",
+        evaluation_text,
+        re.I
+    )
+    if m:
+        return m.group(1)
+    return "N/A"
 
-def extract_text_from_image_b64(img_b64: str, mime_type: str = "image/jpeg"):
-    prompt = "Extract handwritten answer text from this image. Return only the extracted text, do not add comments."
-    return call_gemini(prompt, img_b64=img_b64, mime_type=mime_type)
+# ----------------------
+# UI Layout - Sidebar
+# ----------------------
+st.sidebar.header("Upload & Settings")
+use_sample = st.sidebar.checkbox("Use sample KB (uploaded file path)", value=False)
+uploaded_kb = None
+if use_sample:
+    st.sidebar.write("Sample KB path (local):")
+    st.sidebar.code(SAMPLE_PDF)
+else:
+    uploaded_kb = st.sidebar.file_uploader("Upload Knowledge Base (PDF or TXT)", type=["pdf", "txt"])
 
+uploaded_answers = st.sidebar.file_uploader(
+    "Upload Answer sheets (PDF or image). For multiple, use Ctrl/Cmd+Click",
+    type=["pdf", "png", "jpg", "jpeg"],
+    accept_multiple_files=True
+)
 
-def extract_text_from_pdf_bytes(pdf_bytes: bytes, poppler_path: str = POPPLER_PATH):
-    """
-    Convert PDF bytes to images then use Gemini OCR on each page image.
-    Returns list of extracted page texts and list of base64 preview images.
-    """
-    preview_imgs = []
-    extracted_texts = []
-
-    images = convert_from_bytes(pdf_bytes, dpi=200, poppler_path=poppler_path) if poppler_path else convert_from_bytes(pdf_bytes, dpi=200)
-    for image in images:
-        buf = BytesIO()
-        image.save(buf, format="JPEG")
-        b = base64.b64encode(buf.getvalue()).decode("utf-8")
-        preview_imgs.append(b)
-        text = extract_text_from_image_b64(b, mime_type="image/jpeg")
-        extracted_texts.append(text)
-    return extracted_texts, preview_imgs
-
-
-# ---- Session state for storing intermediate values ----
-if "kb_text" not in st.session_state:
-    st.session_state["kb_text"] = ""
-if "extracted_answers" not in st.session_state:
-    st.session_state["extracted_answers"] = []
-if "preview_imgs" not in st.session_state:
-    st.session_state["preview_imgs"] = []
-if "evaluation" not in st.session_state:
-    st.session_state["evaluation"] = ""
-if "marks" not in st.session_state:
-    st.session_state["marks"] = "N/A"
-
-# ---- Process uploads when user clicks ----
-process_btn = st.button("Process uploads and Evaluate")
-
-if process_btn:
-    if not kb_file or not answer_files:
-        st.error("Please upload both a knowledge base (KB) and at least one answer sheet.")
+if st.sidebar.button("Process uploads"):
+    if not uploaded_answers and not use_sample:
+        st.sidebar.error("Please upload answer file(s) or select sample KB.")
     else:
-        # create temporary upload folder
+        # create unique folder
         upload_id = uuid.uuid4().hex
-        temp_dir = os.path.join(tempfile.gettempdir(), "vigilant_uploads", upload_id)
-        os.makedirs(temp_dir, exist_ok=True)
+        upload_folder = os.path.join(UPLOAD_ROOT, upload_id)
+        os.makedirs(upload_folder, exist_ok=True)
 
-        # Save KB locally and extract text if possible (PyMuPDF)
-        kb_path = None
         kb_text = ""
-        try:
-            kb_fname = secure_filename(kb_file.name)
-        except Exception:
-            kb_fname = kb_file.name
-        kb_path = os.path.join(temp_dir, kb_fname)
-        with open(kb_path, "wb") as f:
-            f.write(kb_file.getbuffer())
-
-        if fitz and kb_path.lower().endswith(".pdf"):
+        # handle KB: sample path or uploaded file
+        if use_sample:
+            # read from local path (works when testing locally)
             try:
-                doc = fitz.open(kb_path)
-                for page in doc:
-                    kb_text += page.get_text()
-                doc.close()
-            except Exception:
-                logging.exception("PyMuPDF extraction failed for KB.")
-        else:
-            # fallback: read first 20k bytes as text if it's txt
-            if kb_path.lower().endswith(".txt"):
-                try:
-                    kb_text = open(kb_path, "r", encoding="utf-8").read()
-                except Exception:
-                    kb_text = ""
-            else:
-                logging.info("KB text extraction skipped (PyMuPDF not available or KB not PDF).")
-
-        st.session_state["kb_text"] = kb_text
-
-        # Process answer files
-        all_extracted = []
-        all_previews = []
-        progress = st.progress(0)
-        total_files = len(answer_files)
-        for idx, file in enumerate(answer_files):
-            filename = file.name
-            safe_name = secure_filename(filename)
-            saved_path = os.path.join(temp_dir, safe_name)
-            with open(saved_path, "wb") as f:
-                f.write(file.getbuffer())
-
-            mime_type = file.type or ( "application/pdf" if filename.lower().endswith(".pdf") else "image/jpeg" )
-            try:
-                if filename.lower().endswith(".pdf") or mime_type == "application/pdf":
-                    pdf_bytes = open(saved_path, "rb").read()
-                    extracted_texts, previews = extract_text_from_pdf_bytes(pdf_bytes, poppler_path=POPPLER_PATH)
-                    # join page texts for this PDF into one string (page breaks)
-                    joined = "\n\n--- Page Break ---\n\n".join(extracted_texts)
-                    all_extracted.append(joined)
-                    all_previews.extend(previews)
-                elif mime_type.startswith("image"):
-                    with open(saved_path, "rb") as fh:
-                        image_bytes = fh.read()
-                    b64 = base64.b64encode(image_bytes).decode("utf-8")
-                    all_previews.append(b64)
-                    txt = extract_text_from_image_b64(b64, mime_type=mime_type)
-                    all_extracted.append(txt)
-                else:
-                    st.warning(f"Unsupported file type: {filename}")
+                with open(SAMPLE_PDF, "rb") as fh:
+                    pdf_bytes = fh.read()
+                _, kb_pages = pdf_to_images_and_text(pdf_bytes)
+                kb_text = "\n\n".join(kb_pages)
+                st.success("Loaded sample KB from disk.")
             except Exception as e:
-                logging.exception("Failed processing file")
-                st.error(f"Failed to process {filename}: {e}")
-            progress.progress((idx+1)/total_files)
+                st.error(f"Failed to open sample KB: {e}")
+        elif uploaded_kb:
+            fname = uploaded_kb.name
+            fpath = os.path.join(upload_folder, fname)
+            with open(fpath, "wb") as fh:
+                fh.write(uploaded_kb.getbuffer())
+            # if PDF, extract text via fitz
+            if fname.lower().endswith(".pdf"):
+                with open(fpath, "rb") as fh:
+                    pdf_bytes = fh.read()
+                _, kb_pages = pdf_to_images_and_text(pdf_bytes)
+                kb_text = "\n\n".join(kb_pages)
+            else:
+                kb_text = uploaded_kb.getvalue().decode("utf-8")
+            st.success("Knowledge base processed.")
 
-        st.session_state["extracted_answers"] = all_extracted
-        st.session_state["preview_imgs"] = all_previews
+        # process answers (images or pdfs)
+        all_pages_text = []
+        preview_images = []
+        for f in uploaded_answers or []:
+            fname = f.name
+            fpath = os.path.join(upload_folder, fname)
+            with open(fpath, "wb") as fh:
+                fh.write(f.getbuffer())
+            mime_type = f.type or mimetypes.guess_type(fname)[0]
+            try:
+                if fname.lower().endswith(".pdf"):
+                    pdf_bytes = open(fpath, "rb").read()
+                    imgs_b64, pages_text = pdf_to_images_and_text(pdf_bytes)
+                    preview_images.extend(imgs_b64)
+                    # OCR each image page
+                    for img_b64 in imgs_b64:
+                        text = call_gemini_ocr_from_b64(img_b64, mime_type="image/jpeg")
+                        all_pages_text.append(text)
+                elif mime_type and mime_type.startswith("image"):
+                    image_bytes = open(fpath, "rb").read()
+                    b64 = base64.b64encode(image_bytes).decode("utf-8")
+                    preview_images.append(b64)
+                    text = call_gemini_ocr_from_b64(b64, mime_type=mime_type)
+                    all_pages_text.append(text)
+                else:
+                    st.warning(f"Unsupported file type: {fname}")
+            except Exception as e:
+                st.error(f"Failed processing {fname}: {e}")
+        # aggregated student answer text
+        student_text = "\n\n--- Page Break ---\n\n".join(all_pages_text)
+        st.session_state["kb_text"] = kb_text
+        st.session_state["student_text"] = student_text
+        st.session_state["preview_images"] = preview_images
+        st.success("All files processed. Open 'Evaluation' tab to run evaluation.")
 
-        # Build evaluation prompt
-        truncated_kb = st.session_state["kb_text"][:4000]  # keep prompt reasonable
-        student_answer = "\n\n--- Answer Documents ---\n\n".join(st.session_state["extracted_answers"])
-        prompt = f"""
-You are a professional examiner evaluating handwritten student answers.
-Question Paper (knowledge base):
-\"\"\"{truncated_kb}\"\"\"
+# ----------------------
+# Main tabs
+# ----------------------
+tab1, tab2 = st.tabs(["Preview", "Evaluation"])
 
-Student Answer(s):
-\"\"\"{student_answer}\"\"\"
+with tab1:
+    st.header("Preview uploaded pages")
+    if "preview_images" in st.session_state and st.session_state["preview_images"]:
+        for i, b64 in enumerate(st.session_state["preview_images"], 1):
+            st.write(f"Page {i}")
+            img = Image.open(BytesIO(base64.b64decode(b64)))
+            st.image(img, use_column_width=True)
+    else:
+        st.info("No preview images yet. Upload files and click 'Process uploads' in the sidebar.")
 
-Please evaluate and return in this format:
-- Total Marks (out of 50)
-- Relevance
-- Accuracy
-- Missing Key Points
-- Suggestions
-- One-line summary feedback
-Return only the evaluation text.
-"""
-        st.info("Calling evaluation API (Gemini). This may take a few seconds...")
-        try:
-            evaluation_text = call_gemini(prompt)
-            st.session_state["evaluation"] = evaluation_text
-        except Exception as e:
-            logging.exception("Evaluation API call failed")
-            st.error(f"Evaluation request failed: {e}")
-            st.session_state["evaluation"] = "[Error calling evaluation API]"
+with tab2:
+    st.header("Evaluation")
+    if "student_text" not in st.session_state:
+        st.info("No extracted text found. Upload & process files first.")
+    else:
+        st.subheader("Extracted student text (preview)")
+        st.text_area("Student text", value=st.session_state["student_text"][:10000], height=250)
 
-        # extract marks
-        m = re.search(r"(?:Total\s*Marks|Marks\s*Awarded|Score)\s*[:=\-]?\s*([0-9]+(?:\.[0-9]+)?(?:\s*/\s*[0-9]+)?)", st.session_state["evaluation"], re.I)
-        if m:
-            st.session_state["marks"] = m.group(1)
-        else:
-            st.session_state["marks"] = "N/A"
+        kb_trim = (st.session_state.get("kb_text") or "")[:4000]
+        st.subheader("Knowledge base (first 4000 chars)")
+        st.text_area("KB", value=kb_trim, height=200)
 
-        st.success("Processing & evaluation complete.")
+        if st.button("Run evaluation (Gemini)"):
+            try:
+                with st.spinner("Calling Gemini for evaluation..."):
+                    evaluation = call_gemini_evaluate(kb_trim, st.session_state["student_text"])
+                st.success("Evaluation complete")
+                st.code(evaluation)
+                marks = extract_marks_from_text(evaluation)
+                st.metric("Total Marks (parsed)", marks)
+                # Save on session for later
+                st.session_state["evaluation"] = evaluation
+                st.session_state["marks"] = marks
+            except Exception as e:
+                st.error(f"Evaluation failed: {e}")
 
-# ---- UI: show KB preview, images, extracted text and evaluation ----
-st.header("Preview / Results")
-
-if st.session_state.get("kb_text"):
-    with st.expander("Knowledge Base (extracted text)"):
-        st.text_area("KB Text (first 4000 chars)", value=st.session_state["kb_text"][:4000], height=200)
-
-if st.session_state.get("preview_imgs"):
-    st.subheader("Preview images from uploaded answers")
-    cols = st.columns(3)
-    for i, b64 in enumerate(st.session_state["preview_imgs"]):
-        col = cols[i % 3]
-        col.image(base64.b64decode(b64), use_column_width=True)
-
-if st.session_state.get("extracted_answers"):
-    st.subheader("Extracted Answer Texts")
-    for i, txt in enumerate(st.session_state["extracted_answers"], 1):
-        st.markdown(f"**Answer Document #{i}:**")
-        st.text_area(f"Extracted text #{i}", value=txt, height=200)
-
-if st.session_state.get("evaluation"):
-    st.subheader("Evaluation from Gemini")
-    st.write(st.session_state["evaluation"])
-    st.markdown(f"**Extracted Marks:** {st.session_state.get('marks', 'N/A')}")
-
+# ----------------------
+# Footer / notes
+# ----------------------
 st.markdown("---")
-st.caption("How it works: The app converts PDFs into page images (requires Poppler for PDF->image). Each image is base64-encoded and sent to Gemini for text extraction. The KB and extracted student answers are sent to Gemini for evaluation.")
-
-# ---- Footer: setup instructions ----
-with st.expander("Setup & Troubleshooting (click to expand)"):
-    st.markdown(r"""
-**1) API Key & Endpoint**
-- Set `API_KEY` and `GEMINI_ENDPOINT` in **Streamlit secrets**:
-  Create a file `.streamlit/secrets.toml` in your project:
+st.markdown(
+    """
+**Notes & Deployment Tips**
+- Set your Gemini API key in Streamlit Cloud Secrets as `GEMINI_API_KEY`.
+- The app uses PyMuPDF (`fitz`) for PDF rendering and text extraction; no Poppler needed.
+- Sample local KB path (for local testing):  
+  `/mnt/data/BDA MODULE 1 ,2  Assignment1.docx (2).pdf`
+"""
+)
