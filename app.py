@@ -34,7 +34,7 @@ os.makedirs(UPLOAD_ROOT, exist_ok=True)
 SAMPLE_PDF = "/mnt/data/BDA MODULE 1 ,2  Assignment1.docx (2).pdf"
 
 st.set_page_config(page_title="AI-Powered-Handwritten-Answer-Sheet-Evaluation", layout="wide")
-st.title("📄 Vigilant — Auto-evaluate Handwritten Answers (Streamlit)")
+st.title("📄AI-Powered-Handwritten-Answer-Sheet-Evaluation")
 
 st.markdown(
     """
