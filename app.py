@@ -288,12 +288,3 @@ with tab2:
 # Footer / notes
 # ----------------------
 st.markdown("---")
-st.markdown(
-    """
-**Notes & Deployment Tips**
-- Set your Gemini API key in Streamlit Cloud Secrets as `GEMINI_API_KEY`.
-- The app uses PyMuPDF (`fitz`) for PDF rendering and text extraction; no Poppler needed.
-- Sample local KB path (for local testing):  
-  `/mnt/data/BDA MODULE 1 ,2  Assignment1.docx (2).pdf`
-"""
-)
