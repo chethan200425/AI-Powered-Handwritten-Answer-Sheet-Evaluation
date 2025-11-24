@@ -33,7 +33,7 @@ os.makedirs(UPLOAD_ROOT, exist_ok=True)
 # Optional preloaded sample file path (from your uploaded files)
 SAMPLE_PDF = "/mnt/data/BDA MODULE 1 ,2  Assignment1.docx (2).pdf"
 
-st.set_page_config(page_title="Vigilant - Auto Evaluate (Streamlit)", layout="wide")
+st.set_page_config(page_title="AI-Powered-Handwritten-Answer-Sheet-Evaluation", layout="wide")
 st.title("📄 Vigilant — Auto-evaluate Handwritten Answers (Streamlit)")
 
 st.markdown(
