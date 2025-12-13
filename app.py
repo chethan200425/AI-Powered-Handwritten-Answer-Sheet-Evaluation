@@ -23,8 +23,8 @@ logging.basicConfig(level=logging.INFO)
 # Streamlit secrets or environment variables
 API_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
 GEMINI_ENDPOINT = st.secrets.get("GEMINI_ENDPOINT") or os.getenv(
-    "GEMINI_ENDPOINT",
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+
 )
 
 # Upload folder (local working copy when running locally)
