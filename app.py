@@ -24,20 +24,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Streamlit secrets or environment variables
 API_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
 
-# CRITICAL FIX: The os.getenv call was incorrect. 
-# Set the default Gemini 2.5 Flash endpoint if no secret or env var is provided.
+# CRITICAL FIX: Ensure a correct default endpoint is used if environment variable is not set.
 GEMINI_ENDPOINT = st.secrets.get("GEMINI_ENDPOINT") or os.getenv("GEMINI_ENDPOINT") or (
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 )
 
 # Upload folder (local working copy when running locally)
-# NOTE: In Streamlit Cloud, this folder will be temporary and reset.
 UPLOAD_ROOT = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_ROOT, exist_ok=True)
 
-# Optional preloaded sample file path (Note: This path MUST exist and be accessible
-# if the app is run locally or if you deploy with a persistent volume/data folder).
-SAMPLE_PDF = os.path.join(os.getcwd(), "sample_data", "assignment.pdf") # Adjusted to a more standard local path
+# Optional preloaded sample file path (must exist on deployment machine)
+SAMPLE_PDF = os.path.join(os.getcwd(), "sample_data", "assignment.pdf") 
 if not os.path.exists(os.path.dirname(SAMPLE_PDF)):
     os.makedirs(os.path.dirname(SAMPLE_PDF), exist_ok=True)
 
@@ -66,7 +63,8 @@ def render_image_from_bytes(img_bytes):
 @st.cache_data(show_spinner="Rendering PDF to Images and Extracting Text...")
 def pdf_to_images_and_text(pdf_bytes):
     """
-    Use PyMuPDF (fitz) to render PDF pages to images (JPEG) and also extract page text.
+    Use PyMuPDF (fitz) to render PDF pages to images (JPEG) with controlled size 
+    to avoid the 4MB API payload limit and also extract page text.
     Returns list of base64 images and list of text strings (per page).
     """
     imgs_b64 = []
@@ -79,11 +77,16 @@ def pdf_to_images_and_text(pdf_bytes):
             page_text = page.get_text()
             texts.append(page_text)
 
-            # render page to image (matrix 2.0 for 2x resolution)
-            mat = fitz.Matrix(2.0, 2.0)
-            # Use 'png' for potentially better quality of complex handwriting, but 'jpeg' is faster/smaller
+            # --- CRITICAL FIX START ---
+            # 1. Reduce resolution matrix: 2.0 is too high for large pages/files.
+            # 1.5 is a good balance for handwriting OCR.
+            mat = fitz.Matrix(1.5, 1.5) 
+            
+            # 2. Add JPEG compression control to reduce file size further.
             pix = page.get_pixmap(matrix=mat, alpha=False)
-            img_bytes = pix.tobytes("jpeg")
+            img_bytes = pix.tobytes("jpeg", jpeg_quality=80) # Added jpeg_quality=80
+            # --- CRITICAL FIX END ---
+            
             b64 = base64.b64encode(img_bytes).decode("utf-8")
             imgs_b64.append(b64)
         doc.close()
@@ -119,7 +122,8 @@ def call_gemini_ocr_from_b64(img_b64: str, mime_type="image/jpeg"):
     
     # Use f-string for endpoint + key query parameter
     resp = requests.post(f"{GEMINI_ENDPOINT}?key={API_KEY}", json=request_body, timeout=60)
-    resp.raise_for_status()
+    # Check for non-200 responses and raise an exception with the status code
+    resp.raise_for_status() 
     data = resp.json()
     
     # Parse response safely
@@ -314,7 +318,8 @@ if st.sidebar.button("Process uploads"):
                         st.warning(f"Unsupported file type for processing: {fname}")
                         
                 except Exception as e:
-                    st.error(f"Failed processing {fname}: {e}")
+                    # Catch the API error here and provide more context
+                    st.error(f"Failed processing {fname}: API Error. This is usually due to image size. Details: {e}")
                     logging.exception(f"File Processing Error: {fname}")
 
         # aggregated student answer text
@@ -349,8 +354,10 @@ with tab1:
             
             with col2:
                 st.subheader(f"Page {i} (Extracted Text)")
-                extracted_text = st.session_state["student_text"].split("\n\n--- Page Break ---\n\n")[i-1]
-                st.code(extracted_text or "[Extraction failed or returned no text]", language="text")
+                # Safely get the extracted text for the current page
+                page_texts = st.session_state["student_text"].split("\n\n--- Page Break ---\n\n")
+                extracted_text = page_texts[i-1] if i-1 < len(page_texts) else "[Extraction failed or returned no text]"
+                st.code(extracted_text, language="text")
                 
             st.markdown("---")
     else:
@@ -379,8 +386,6 @@ with tab2:
                     call_gemini_evaluate.clear() 
                     
                     with st.spinner("Calling Gemini for detailed evaluation..."):
-                        # Use the trimmed KB text as the input, as the prompt is large enough
-                        # to handle the combined input for the model used.
                         evaluation = call_gemini_evaluate(kb_text[:4000], student_text) 
                     
                     st.success("Evaluation complete")
